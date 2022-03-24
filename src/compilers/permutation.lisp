@@ -1,8 +1,12 @@
 ;;;; permutation.lisp
+;;;;
+;;;; Author: Charles Zhang
+
+(in-package #:cl-quil)
+
 ;;;; This file implements routines to decompose and synthesize
 ;;;; permutation matrices representing classical reversible circuits.
 
-(in-package #:cl-quil)
 
 ;;;; young group decomposition based algorithm for permutation gates
 
@@ -63,6 +67,7 @@
       (dotimes (i size)
         (assert (= (aref right (aref perm (aref left i)))
                    (aref old-perm i))))
+      ;; Return g1 and g2 in "mathematical" or "composition" order.
       (values left right))))
 
 (defstruct single-target-gate
@@ -73,74 +78,87 @@
   (target (missing-arg) :type fixnum :read-only t))
 
 (defun single-target-gate-decomposition! (perm)
-  "PERM permutes computational basis to computational basis. This algorithm produces at most 2n-1 single target gates where n is the number of bits, which is nearly optimal."
-  (let ((length (length perm)))
-    (assert (power-of-two-p length))
-    (let ((n-qubits (1- (integer-length length)))
-          (left-gates '())
-          (right-gates '()))
-      (dotimes (qubit n-qubits)
-        (multiple-value-bind (left right)
-            (decompose! perm qubit)
-          (flet ((single-target-gate-from-permutation (permutation)
-                   (multiple-value-bind (truth-table vars)
-                       (truth-table-minimize-base!
-                        (make-truth-table n-qubits
-                                          :initial-contents
-                                          (loop for value across permutation
-                                                for row from 0
-                                                collect (if (= value row) 0 1))))
-                     (unless (truth-table-zero-p truth-table)
-                       (assert (not (member qubit vars)))
-                       (make-single-target-gate
-                        :function truth-table
-                        :control-lines (coerce (sort vars #'<) 'vector)
-                        :target qubit)))))
-            (let ((left-gate (single-target-gate-from-permutation left))
-                  (right-gate (single-target-gate-from-permutation right)))
-              (when left-gate (push left-gate left-gates))
-              (when right-gate (push right-gate right-gates))))))
-      ;; Combine the left and right gates in the right order. It's
-      ;; possible as an additional optimization to merge the
-      ;; right-most left gate and the left-most right gate (assuming
-      ;; neither is the identity) because they act on the same
-      ;; target. In fact, probably any consecutive gates acting on the
-      ;; same target can be merged iteratively.
-      (nreconc left-gates right-gates))))
+  "PERM permutes computational basis to computational basis. This algorithm produces at most 2n-1 single target gates (acting on qubits numbered 0 to n-1) where n is the number of bits, which is nearly optimal."
+  (assert (power-of-two-p (length perm)))
+  (let ((n-qubits (ilog2 (length perm)))
+        (left-gates '())
+        (right-gates '()))
+    (dotimes (index n-qubits)
+      (multiple-value-bind (left right)
+          (decompose! perm index)
+        (flet ((single-target-gate-from-permutation (permutation)
+                 (multiple-value-bind (truth-table vars)
+                     (truth-table-minimize-base!
+                      (make-truth-table n-qubits
+                                        :initial-contents
+                                        (loop :for value :across permutation
+                                              :for row :from 0
+                                              :collect (if (= value row) 0 1))))
+                   (unless (truth-table-zero-p truth-table)
+                     (assert (not (member index vars)))
+                     (make-single-target-gate
+                      :function truth-table
+                      :control-lines (coerce (sort vars #'<) 'vector)
+                      :target index)))))
+          (let ((left-gate (single-target-gate-from-permutation left))
+                (right-gate (single-target-gate-from-permutation right)))
+            (when left-gate (push left-gate left-gates))
+            (when right-gate (push right-gate right-gates))))))
+    ;; Combine the left and right gates in "Quil" order (composition
+    ;; applies left-to-right), hence the unintuitive "right" listed
+    ;; before "left".
+    ;;
+    ;; It's possible as an additional optimization to merge the
+    ;; right-most left gate and the left-most right gate (assuming
+    ;; neither is the identity) because they act on the same
+    ;; target. In fact, probably any consecutive gates acting on the
+    ;; same target can be merged iteratively.
+    (nreconc right-gates left-gates)))
 
 ;;; Synthesize a single target gate by using PPRM (positive polarity
-;;; Reed-Mueller form).
-(defun simple-single-target-gate-synthesize (gate)
+;;; Reed-Mueller) form.
+(defun simple-single-target-gate-synthesize (gate qubits)
+  "Synthesize a single-target gate GATE into Quil instructions acting on qubits QUBITS."
   (let ((control-lines (single-target-gate-control-lines gate))
         (target (single-target-gate-target gate))
-        (function (single-target-gate-function gate))
         (circuit '()))
-    (let ((esop (truth-table-esop-from-pprm function)))
-      (dolist (cube esop)
-        (let ((translated-controls '()))
-          (dotimes (index (length cube))
-            (let ((trit (aref cube index)))
-              (assert (/= trit -1)) ; *PP*RM
-              (unless (= trit 0)
-                (push (aref control-lines index) translated-controls))))
-          (case (length translated-controls)
-            (0 (push (build-gate "X" () target) circuit))
-            (1 (push (build-gate "CNOT" () (first translated-controls) target) circuit))
-            (2 (push (build-gate "CCNOT" ()
-                                 (first translated-controls)
-                                 (second translated-controls)
-                                 target)
-                     circuit))
-            (t
-             (push (apply #'build-multiple-controlled-gate
-                    "X" () (append translated-controls (list target)))
-                   circuit))))))
-    (nreverse circuit)))
+    ;; Translate CONTROL-LINES and TARGET into expected qubit numbers.
+    ;;
+    ;; Somewhat inconveniently, the previous decomposition functions
+    ;; assume qubits are listed 0 to n-1, instead of n-1 to 0, the
+    ;; latter of which would be more natural in Quil. This is why we
+    ;; must reverse.
+    (setf qubits        (reverse qubits)
+          target        (aref qubits target)
+          control-lines (map 'vector (lambda (i) (aref qubits i)) control-lines))
+    ;; Perform the decomposition.
+    (dolist (cube (truth-table-esop-from-pprm (single-target-gate-function gate)))
+      (let ((translated-controls '()))
+        (dotimes (index (length cube))
+          (let ((trit (aref cube index)))
+            (assert (/= trit -1)) ; *PP*RM
+            (unless (= trit 0)
+              (push (aref control-lines index) translated-controls))))
+        (case (length translated-controls)
+          (0 (push (build-gate "X" () target) circuit))
+          (1 (push (build-gate "CNOT" () (first translated-controls) target) circuit))
+          (2 (push (build-gate "CCNOT" ()
+                               (first translated-controls)
+                               (second translated-controls)
+                               target)
+                   circuit))
+          (t
+           (push (apply #'build-multiple-controlled-gate
+                        "X" () (append translated-controls (list target)))
+                 circuit)))))
+    ;; Return the circuit in "Quil" order (left-to-right).
+    circuit))
 
-(defun synthesize-permutation (permutation)
-  (let ((permutation (make-array (length permutation) :initial-contents permutation)))
-    (reduce #'append (mapcar #'simple-single-target-gate-synthesize
-                             (single-target-gate-decomposition! permutation)))))
+(defun synthesize-permutation (permutation qubits)
+  "Synthesize the operator represented by the permutation PERMUTATION acting on the qubits QUBITS."
+  (loop :with permutation := (make-array (length permutation) :initial-contents permutation)
+        :for target-gate :in (single-target-gate-decomposition! permutation)
+        :nconcing (simple-single-target-gate-synthesize target-gate qubits)))
 
 (defun permutation-gate-to-mcx (instr &key context)
   "Compile instructions representing permutation gates to n-qubit Toffoli gates."
@@ -153,17 +171,13 @@
     (let* ((perm-gate (funcall
                        (operator-description-gate-lifter
                         (application-operator instr))
-                       res))
-           (qubits (reverse (application-arguments instr))))
+                       res)))
       (cond
         ((and (typep perm-gate 'permutation-gate)
-              (> (length qubits) 2))
-         (let* ((perm (permutation-gate-permutation perm-gate))
-                (code (synthesize-permutation perm))
-                (relabler (lambda (q)
-                            (setf (qubit-index q)
-                                  (qubit-index (nth (qubit-index q) qubits))))))
-           (map nil (a:rcurry #'cl-quil.frontend::%relabel-qubits relabler) code)
+              (> (gate-dimension perm-gate) 4)) ; N.B. Dimension, not arity!
+         (let* ((code (synthesize-permutation
+                       (permutation-gate-permutation perm-gate)
+                       (map 'vector #'qubit-index (application-arguments instr)))))
            ;; If synthesis produces a 1 instruction sequence, that
            ;; means that the original instruction represents a n-qubit
            ;; controlled Toffoli gate, so we didn't do anything and
